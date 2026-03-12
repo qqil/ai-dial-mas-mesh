@@ -56,7 +56,93 @@ class BaseAgentTool(BaseTool, ABC):
         # 6. Return Tool message
         #    ⚠️ Remember, tool message must have tool call id, also don't forget to add `custom_content` since we need
         #       to save properly tool history to choice state later
-        raise NotImplementedError()
+        dial_client = AsyncDial(
+            api_version='2025-01-01-preview', 
+            base_url=self.endpoint,
+            api_key=tool_call_params.api_key,
+        )
+
+        arguments = json.loads(tool_call_params.tool_call.function.arguments)
+        print(f"Tool call arguments: {arguments}")
+        stage = tool_call_params.stage
+        stage.append_name(f": {arguments.get("prompt")}")
+
+        conversation_id = tool_call_params.conversation_id
+        messages = self._prepare_messages(tool_call_params=tool_call_params)
+
+        content = ""
+        custom_content = CustomContent(attachments=[])
+        stages_map: dict[int, Stage] = {}
+
+        response = await dial_client.chat.completions.create(
+            deployment_name=self.deployment_name,
+            messages=messages, # type: ignore
+            extra_headers={
+                "x-conversation-id": conversation_id
+            },
+            # extra_body={
+            #     "custom_fields": { **arguments }
+            # },
+            stream=True
+        )
+
+        async for chunk in response:
+            if not chunk.choices or len(chunk.choices) == 0:
+                continue
+
+            delta = chunk.choices[0].delta
+
+            if not delta:
+                continue
+
+            if delta.content:
+                stage.append_content(delta.content)
+                content += delta.content
+            
+            if delta.custom_content:
+                if delta.custom_content.attachments:
+                    custom_content.attachments.extend(delta.custom_content.attachments) # type: ignore
+                
+                if delta.custom_content.state:
+                    custom_content.state = delta.custom_content.state
+
+                delta_custom_content_dict = delta.custom_content.dict(exclude_none=True)
+                stages = delta_custom_content_dict.get("stages")
+                
+                if not stages:
+                    continue
+
+                for delta_custom_content_stage in stages:
+                    idx = delta_custom_content_stage["index"]
+                    opened_stage = stages_map.get(idx)
+                    if opened_stage:
+                        if stg_name := delta_custom_content_stage.get("name"):
+                            opened_stage.append_name(stg_name)
+                        if stg_content := delta_custom_content_stage.get("content"):
+                            opened_stage.append_content(stg_content)
+                        if stg_attachments := delta_custom_content_stage.get("attachments"):
+                            for att in stg_attachments:
+                                opened_stage.add_attachment(Attachment(**att))
+                        if delta_custom_content_stage.get('status') == 'completed':
+                            StageProcessor.close_stage_safely(opened_stage)
+                    else:
+                        stages_map[idx] = StageProcessor.open_stage(tool_call_params.choice, delta_custom_content_stage.get("name"))
+        
+        for stage in stages_map.values():
+            StageProcessor.close_stage_safely(stage)
+
+
+        for attachment in custom_content.attachments: # type: ignore
+            tool_call_params.choice.add_attachment(attachment=attachment)
+
+        return Message(
+            role=Role.TOOL,
+            content=content,
+            custom_content=custom_content,
+            tool_call_id=tool_call_params.tool_call.id
+        )
+
+        
 
     def _prepare_messages(self, tool_call_params: ToolCallParams) -> list[dict[str, Any]]:
         #TODO:
@@ -76,4 +162,47 @@ class BaseAgentTool(BaseTool, ABC):
         #   message. For assistant message you need to make a deepcopy and refactor the state for copied message, instead
         #   of the whole state you need to get from the state value by `self.name`
         # 4. Lastly, add the user message with `prompt` and don't forget about the custom_content
-        raise NotImplementedError()
+        arguments = json.loads(tool_call_params.tool_call.function.arguments)
+
+        prompt = arguments.get("prompt")
+        propagate_history = bool(arguments.get("propagate_history", False))
+
+        messages = []
+
+        if propagate_history:
+            for msg_idx in range(len(tool_call_params.messages)):
+                msg = tool_call_params.messages[msg_idx]
+
+                # Process only assistant messages, user message (that is always before assistant message)
+                # will be added later during processing
+                if msg.role != Role.ASSISTANT:
+                    continue
+
+                # Skip assistant messages without custom_content and state
+                if not msg.custom_content or not msg.custom_content.state:
+                    continue
+
+                msg_state = msg.custom_content.state
+                # Skip if in assistant message state does not exist our tool name
+                if not msg_state.get(self.name):
+                    continue
+
+                # Add user message (that is before assistant message)
+                messages.append(tool_call_params.messages[msg_idx - 1].model_dump(exclude_none=True))
+
+                # Add assistant message with updated state that contains only current tool state
+                msg_copy = deepcopy(msg)
+                msg_copy.custom_content.state = msg_state.get(self.name) # type: ignore
+                messages.append(msg_copy.model_dump(exclude_none=True))
+
+
+
+        last_message = tool_call_params.messages[-1]
+        custom_content = last_message.custom_content.dict(exclude_none=True) if last_message.custom_content else None
+        messages.append({
+            "role": Role.USER,
+            "content": prompt,
+            "custom_content": custom_content
+        })
+
+        return messages

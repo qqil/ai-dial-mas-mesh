@@ -2,8 +2,8 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from aidial_client.types.chat import ToolParam, FunctionParam
-from aidial_client.types.chat.legacy.chat_completion import Role
-from aidial_sdk.chat_completion import Message
+# from aidial_client.types.chat.legacy.chat_completion import Role
+from aidial_sdk.chat_completion import Message, Role
 from pydantic import StrictStr
 
 from task.tools.models import ToolCallParams, ToolStageConfig
@@ -14,17 +14,17 @@ class BaseTool(ABC):
     async def execute(self, tool_call_params: ToolCallParams) -> Message:
         msg =  Message(
             role=Role.TOOL,
-            name=StrictStr(tool_call_params.tool_call.function.name),
-            tool_call_id=StrictStr(tool_call_params.tool_call.id),
+            name=tool_call_params.tool_call.function.name,
+            tool_call_id=tool_call_params.tool_call.id,
         )
         try:
             result = await self._execute(tool_call_params)
             if isinstance(result, Message):
                 msg = result
             else:
-                msg.content = StrictStr(result)
+                msg.content = result
         except Exception as e:
-            msg.content = StrictStr(f"ERROR during tool call execution:\n {e}")
+            msg.content = f"ERROR during tool call execution:\n {e}"
 
         return msg
 
